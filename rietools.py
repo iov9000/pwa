@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+from scipy.special import erf,erfc,gamma
 
 def cayley(u,v):
     x = (u**2 + v**2-1)/(u**2+(1+v)**2)
@@ -108,6 +109,11 @@ def np_exp_map(v,c=1.0):
     res = np.tanh(np.sqrt(c)*np.linalg.norm(v,2,axis=1,keepdims=True))*v/(np.sqrt(c)*np.linalg.norm(v,2,axis=1,keepdims=True))
     return np_project_hyp_vec(res,c)
 
+def np_log_map(v,c=1.0):
+    #v = v + 1e-7 # against nan
+    norm_v = np.linalg.norm(v,2,axis=1,keepdims=True)
+    return np.arctanh(np.sqrt(c)*norm_v)*v/(np.sqrt(c)*norm_v)
+
 def log_map(v,c=1.0):
     #norm_v = tf.Print(tf.norm(v,2,axis=1,keepdims=True),[tf.norm(v,2,axis=1,keepdims=True)])
     norm_v = tf.norm(v,2,axis=1,keepdims=True)
@@ -124,26 +130,6 @@ def tf_log_map_x(x, y, c):
     lam = tf_lambda_x(x, c)
     return ( ( (2. / np.sqrt(c)) / lam) * tf_atanh(np.sqrt(c) * norm_diff) / norm_diff) * diff
 
-def hyp_fflayer(x,dim,activation=None,name='',c=1.0):
-    with tf.variable_scope("hyp_ff_layer_"+name):
-        W = tf.get_variable('weight',shape=[x.get_shape().as_list()[1],dim],
-                           initializer=tf.contrib.layers.xavier_initializer())
-        b = tf.get_variable('hypbias',shape=[dim], initializer=tf.constant_initializer(0.0))
-        # input x is Euclidean -> project to disk
-        x = exp_map(x,c=1.0) + 1e-7
-        #b = exp_map(tf.expand_dims(b,0),c=1.0) + 1e-7
-        b = tf.expand_dims(b,0)
-        Mx = tf.matmul(x,W) + 1e-7
-        Mx_norm = tf.norm(Mx,2,axis=1,keepdims=True)
-        x_norm = tf.norm(x,2,axis=1,keepdims=True)
-        y = 1./tf.sqrt(c)*tf_tanh(Mx_norm/x_norm*tf_atanh(tf.sqrt(c)*x_norm))*Mx/Mx_norm
-        y = project_hyp_vec(y,c)
-        y = mobius_add(y,b,c)
-        if activation is not None:
-            # hyperbolic non-linearity
-            y = exp_map(activation(log_map(y,c)),c)
-        return y
-    
 def np_gauss_prob_halfplane(x,mu,sigma):
     # using poincaré half-plane
     Z = 2*np.pi*np.sqrt(np.pi/2)*sigma*np.exp(sigma**2/2)*erf(sigma/np.sqrt(2.0))

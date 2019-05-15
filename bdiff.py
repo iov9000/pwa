@@ -51,6 +51,71 @@ def generate_tree_dataset(n_train,n_test,scale,treedepth,b,c,d,offset,strict_nor
     
     return X_train,X_train_flat,X_test
 
+def draw_latent_tree_tsne(opts,X,treedepth,b,c,d,subset_len,plot_means=False):
+    input_dim = d
+    X_tree = np.reshape(X,[-1,b**(treedepth+1),c,d])
+    X_subset = X_tree[0:subset_len,:,:,:]
+    plt.figure(figsize=(10, 10)) 
+    
+    # plot tree
+    z_signal = np.reshape(X_subset[:,:,0,:],[-1,input_dim])
+    # mean over vertex noise points
+    z_signal_means = np.mean(X_subset,2)
+    z_signal = np.reshape(z_signal,[X_subset.shape[0],b**(treedepth+1),-1])
+
+    z_noise = X_subset[:,:,1:,:]    
+    color = ['r','g','y','m','b','c','k']
+
+    for i in range(subset_len):
+        for j in range(b**treedepth-1):
+            clr = np.int(np.floor(np.log2(j+1)))
+            parent = z_signal[i,j,:]
+
+            plt.scatter(parent[0], parent[1], c=color[clr],marker='+',s=0.5)
+
+            left = z_signal[i,2*j+1,:]
+            right = z_signal[i,2*j+2,:]
+
+            plt.scatter(left[0], left[1], c=color[clr+1],marker='+')
+            plt.scatter(right[0], right[1], c=color[clr+1],marker='+')
+
+            plt.scatter(z_noise[i,j,:,0],z_noise[i,j,:,1],color=color[clr],marker='.')
+            plt.scatter(z_noise[i,2*j+1,:,0],z_noise[i,2*j+1,:,1],color=color[clr+1],marker='.')
+            plt.scatter(z_noise[i,2*j+2,:,0],z_noise[i,2*j+2,:,1],color=color[clr+1],marker='.')
+
+            #draw lines of tree
+            x = [parent[0],left[0]]
+            y = [parent[1],left[1]]
+            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            x = [parent[0],right[0]]
+            y = [parent[1],right[1]]
+            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            
+            #draw lines of mean tree
+            if plot_means:
+                parent_mean = z_signal_means[i,j,:]
+                left_mean = z_signal_means[i,2*j+1,:]
+                right_mean = z_signal_means[i,2*j+1,:]
+                plt.scatter(parent_mean[0], parent_mean[1], c=color[clr],marker='*')
+                plt.scatter(left_mean[0], left_mean[1], c=color[clr+1],marker='*')
+                plt.scatter(right_mean[0], right_mean[1], c=color[clr+1],marker='*')
+
+                x = [parent_mean[0],left_mean[0]]
+                y = [parent_mean[1],left_mean[1]]
+                plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+                x = [parent_mean[0],right_mean[0]]
+                y = [parent_mean[1],right_mean[1]]
+                plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+
+    #plt.scatter(z_noise[:,0],z_noise[:,1],color='k',marker='+')
+    #plt.colorbar()
+    ax = plt.gca()
+    circle = plt.Circle((0, 0), 1.0, color='k', fill=False)
+    ax.add_artist(circle)
+    plt.axis('equal')
+    plt.grid()
+    plt.show()
+
 def draw_latent_tree(opts,X_test,model,treedepth,b,c,d,subset_len,plot_means=False):
 
     input_dim = d

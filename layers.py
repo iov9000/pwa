@@ -1,7 +1,7 @@
 import tensorflow as tf
 import numpy as np
 fc = tf.layers.dense
-from rietools import mobius_add,tf_norm,tf_lambda_x,tf_dot
+from rietools import *
 
 def mlr_layer(x,d,opts,c_val=1.0):
     A_mlr = []
@@ -60,3 +60,25 @@ def dec_mlp(z,opts):
     g3 = fc(g2,100,name='dec_f3',activation=opts['nn_act_fn'])
     x_hat = fc(g3,opts['input_dim'],name='dec_f4',activation=None)
     return x_hat, tf.nn.sigmoid(x_hat)
+
+
+def hyp_fflayer(x,dim,activation=None,name='',c=1.0):
+    with tf.variable_scope("hyp_ff_layer_"+name):
+        W = tf.get_variable('weight',shape=[x.get_shape().as_list()[1],dim],
+                           initializer=tf.contrib.layers.xavier_initializer())
+        b = tf.get_variable('hypbias',shape=[dim], initializer=tf.constant_initializer(0.0))
+        # input x is Euclidean -> project to disk
+        x = exp_map(x,c=1.0) + 1e-7
+        #b = exp_map(tf.expand_dims(b,0),c=1.0) + 1e-7
+        b = tf.expand_dims(b,0)
+        Mx = tf.matmul(x,W) + 1e-7
+        Mx_norm = tf.norm(Mx,2,axis=1,keepdims=True)
+        x_norm = tf.norm(x,2,axis=1,keepdims=True)
+        y = 1./tf.sqrt(c)*tf_tanh(Mx_norm/x_norm*tf_atanh(tf.sqrt(c)*x_norm))*Mx/Mx_norm
+        y = project_hyp_vec(y,c)
+        y = mobius_add(y,b,c)
+        if activation is not None:
+            # hyperbolic non-linearity
+            y = exp_map(activation(log_map(y,c)),c)
+        return y
+    

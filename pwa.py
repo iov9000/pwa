@@ -1,3 +1,4 @@
+import os
 import tensorflow as tf
 import numpy as np
 from rietools import *
@@ -18,6 +19,8 @@ class PWA(object):
         self.c = opts['hyp_c']
         self.q = opts['mmd_q']
         self.use_expmap= opts['use_expmap']
+        self.act_mu = opts['enc_act_mu']
+        self.act_sigma = opts['enc_act_sigma']
         
         #build a network
         self.build()
@@ -38,7 +41,7 @@ class PWA(object):
         self.x = tf.placeholder(name='x',dtype=tf.float32,shape=[None,self._opts['input_dim']])  #shape=(batch_size,input_dim)
         #self.bs_ph = tf.placeholder(name='bs',dtype=tf.int32,shape=())
         #encoder
-        if opts['nw_type'] == 'simple':
+        if self._opts['nw_type'] == 'simple':
             e = enc_simple(self.x,self._opts)
         else:
             e = enc_mlp(self.x,self._opts)
@@ -48,19 +51,19 @@ class PWA(object):
         #self.log_sigma = exp_map(tf.layers.dense(f3,self.dim_z,name='enc_sigma',activation=tf.nn.softplus),c=self.c)
         
         # make these layers fully hyperbolic
-        self.mu = hyp_fflayer(e,self.dim_z,name='mu',activation=None)
+        self.mu = hyp_fflayer(e,self.dim_z,name='mu',activation=self.act_mu)
 
         #self.mu = exp_map(tf.layers.dense(e,self.dim_z,name='mu',activation=None),c=self.c)
         if self._opts['scalar_dispersion']:
             if self._opts['hyp_var']:
-                self.log_sigma = hyp_fflayer(e,1,name='sigma',activation=None)
+                self.log_sigma = hyp_fflayer(e,1,name='sigma',activation=self.act_sigma)
             else:
-                self.log_sigma = tf.layers.dense(e,1,name='sigma',activation=None)
+                self.log_sigma = tf.layers.dense(e,1,name='sigma',activation=self.act_sigma)
         else:
             if self._opts['hyp_var']:
-                self.log_sigma = hyp_fflayer(e,self.dim_z,name='sigma',activation=None)
+                self.log_sigma = hyp_fflayer(e,self.dim_z,name='sigma',activation=self.act_sigma)
             else:    
-                self.log_sigma = tf.layers.dense(e,self.dim_z,name='sigma',activation=None)
+                self.log_sigma = tf.layers.dense(e,self.dim_z,name='sigma',activation=self.act_sigma)
 
         #self.mu = self.mu/tf.norm(self.mu,2,axis=1,keepdims=True)
         #self.log_sigma = self.log_sigma/tf.norm(self.log_sigma,2,axis=1,keepdims=True)
@@ -265,6 +268,9 @@ class PWA(object):
                                     self.z], feed_dict={self.x: x})
         
         #print(logmap_norm)
+        #print("Encoder output: Mu norm", np.linalg.norm(mu))
+        #print("Encoder output: Log sigma norm", np.linalg.norm(sigma))
+
         #step = tf.train.get_global_step()
         #writer.add_summary(summary,step)
         #rep = self.sess.run(self.reproj_op)

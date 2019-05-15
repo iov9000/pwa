@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+from rietools import gauss_prob_pd
 
 def contrast_norm(pics):
     # pics is a [N, H, W, C] tensor
