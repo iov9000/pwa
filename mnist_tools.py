@@ -26,6 +26,8 @@ def recon(model):
             I_reconstructed[i*h:(i+1)*h,j*2*w:(j+1)*2*w] = x
     plt.figure(figsize = (10,20))
     plt.imshow(I_reconstructed,cmap='gray')
+    if savefig:
+        plt.savefig("fig/mnist_disk_5ep.png")
     #plt.savefig('mnist_recon.png',dpi=300)
 
 def gen_circle(model):
@@ -54,10 +56,11 @@ def gen_circle(model):
     plt.figure(figsize=(12, 12))
     plt.axis('off')
     plt.imshow(I_latent, cmap="gray_r")
-    plt.savefig("fig/mnist_disk_5ep.png")
     plt.show()
+    if savefig:
+        plt.savefig("fig/mnist_disk_5ep.png")
     
-def gen_grid(model):
+def gen_grid(model,savefig=False):
     ### Test the trained model: generation
     # Sample noise vectors from N(0, 1)
     #z = np.random.normal(size=[model.batch_size, model.dim_z])
@@ -84,7 +87,8 @@ def gen_grid(model):
     plt.figure(figsize=(8, 8))
     plt.axis('off')
     plt.imshow(I_generated, cmap='gray_r')
-    #plt.savefig('mnist_5_h_100ep.png')
+    if savefig:
+        plt.savefig('fig/mnist_5_h_100ep.png')
     
 def gen_geodesic_interpolation(model):
     # gen line in euclidean space

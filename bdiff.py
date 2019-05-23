@@ -221,10 +221,10 @@ def draw_latent_tree(opts,X_test,model,treedepth,b,c,d,subset_len,plot_means=Fal
             #draw lines of tree
             x = [parent[0],left[0]]
             y = [parent[1],left[1]]
-            #plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
             x = [parent[0],right[0]]
             y = [parent[1],right[1]]
-            #plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
                         
             #draw lines of mean tree
             if plot_means:
