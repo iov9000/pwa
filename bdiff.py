@@ -4,14 +4,16 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 unused import
 
 import matplotlib.pyplot as plt
 from rietools import *
+import scipy
+
 
 # create the synthetic tree dataset here iteratively
-def generate_tree_dataset(n_train,n_test,scale,treedepth,b,c,d,offset,strict_norms,center):
+def generate_tree_dataset(n_train,n_test,scale,treedepth,b,c,d,offset,strict_norms,center,stricter_norms=False):
     N = n_train + n_test
     
     nr_nodes = b**(treedepth+1)
 
-    #X = np.random.randn(N,nr_nodes,c,d)
+    #X = scale*np.random.randn(N,nr_nodes,c,d)
     X = np.zeros([N,nr_nodes,c,d])
     print("Generating trees...")
     for i in range(N):
@@ -23,13 +25,21 @@ def generate_tree_dataset(n_train,n_test,scale,treedepth,b,c,d,offset,strict_nor
                     X[i,2*j+k+1,0,:] = np.random.randn(d)*offset + ancestor 
                     while(np.linalg.norm(X[i,2*j+k+1,0,:]) <= np.linalg.norm(ancestor)):
                         X[i,2*j+k+1,0,:] = np.random.randn(d)*offset + ancestor 
+                elif stricter_norms:
+                    X[i,2*j+k+1,0,:] = np.random.randn(d)*offset + ancestor 
+                    while(np.linalg.norm(X[i,2*j+k+1,0,:]) <= np.linalg.norm(ancestor) and np.abs(np.dot(X[i,2*j+k+1,0,:],ancestor))>=3): 
+                        X[i,2*j+k+1,0,:] = np.random.randn(d)*offset + ancestor 
+                    
+                    #scale = np.linalg.norm(X[i,2*j+k+1,0,:])/(1.5*np.linalg.norm(ancestor))
+                    #X[i,2*j+k+1,0,:] /= scale 
                 else:
                     X[i,2*j+k+1,0,:] = np.random.randn(d)*offset + ancestor 
 
-                # additional noise
+                # additional noise of var 1/c
                 for l in range(1,c):
-                    X[i,2*j+k+1,l,:] = 1/c*np.random.randn(d) + X[i,2*j+k+1,0,:]
+                    X[i,2*j+k+1,l,:] = np.sqrt(1/c)*np.random.randn(d) + X[i,2*j+k+1,0,:]
 
+    print(X[0,0,0,:])
     print("Done")
 
     # flatten the data            
@@ -45,10 +55,43 @@ def generate_tree_dataset(n_train,n_test,scale,treedepth,b,c,d,offset,strict_nor
         X_train = (X_train-mu)/stdev
         X_test = (X_test-mu)/stdev
 
+    #X_train[0,:] = X_train[0,:]*0
+    #X_test[0,:] = X_test[0,:]*0
+
     X_train_flat = X_train
     X_train = np.reshape(X_train,[n_train,-1,c,d])
     X_test = np.reshape(X_test,[n_test,-1,c,d])
     
+    return X_train,X_train_flat,X_test
+
+def generate_binary_tree(n_train,n_test,scale,treedepth,b,c,offset,strict_norms,center):
+    N = n_train + n_test
+    nr_nodes = b**(treedepth+1)
+    d = treedepth
+
+    #X = np.random.randn(N,nr_nodes,c,d)
+    X = np.zeros([N,nr_nodes,c,d])
+    X[end] = 1
+    for i in range(N):
+        for j in range(b**treedepth-1):
+            # true tree
+            ancestor = X[i,j,0,:]
+            for k in range(b):
+                # perturb one bit not shared with ancestor or neighbour
+                bit_to_be_flipped = np.rand.randint(1,d-np.sum(ancestor)+1)
+                X[i,2*j+k+1,0,:] = ancestor
+                X[i,2*j+k+1,0,bit_to_be_flipped] = 1
+
+                # additional noise: perturb extra bits with uniform prob
+                for l in range(1,c):
+                    X[i,2*j+k+1,l,:] = np.random.randint(2,d) + X[i,2*j+k+1,0,:]
+    
+    # flatten the data            
+    X_train = X[:n_train,:]
+    X_test = X[-n_test:,:]
+    X_train_flat = np.reshape(X_train,[-1,d])
+    X_test_flat = np.reshape(X_test,[-1,d])
+
     return X_train,X_train_flat,X_test
 
 def draw_latent_tree_tsne(opts,X,treedepth,b,c,d,subset_len,plot_means=False):
@@ -117,7 +160,16 @@ def draw_latent_tree_tsne(opts,X,treedepth,b,c,d,subset_len,plot_means=False):
     plt.show()
 
 def draw_latent_tree(opts,X_test,model,treedepth,b,c,d,subset_len,plot_means=False):
-
+    """
+    
+        Transforms a test tree in input space using the trained model and draws
+        a tree in latent space for visualization purposes
+        
+        X_test: test data (R^{nxd}: flattened tree)
+        model: trained encoder model
+        
+    
+    """
     input_dim = d
     X_test_subset = X_test[0:subset_len,:,:,:]
     plt.figure(figsize=(10, 10)) 
@@ -133,7 +185,7 @@ def draw_latent_tree(opts,X_test,model,treedepth,b,c,d,subset_len,plot_means=Fal
 
     # plot tree
     signal = np.reshape(X_test[:,:,0,:],[-1,input_dim])
-    z_signal = model.transformer_mu(signal)
+    z_signal = model.transformer_mu(signal) # posterior means (signal)
     # mean over vertex noise points
     z_signal_means = np.mean(X_test,2)
     #z_signal_means = np.mean(z_signal_means,1)
@@ -169,10 +221,10 @@ def draw_latent_tree(opts,X_test,model,treedepth,b,c,d,subset_len,plot_means=Fal
             #draw lines of tree
             x = [parent[0],left[0]]
             y = [parent[1],left[1]]
-            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            #plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
             x = [parent[0],right[0]]
             y = [parent[1],right[1]]
-            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            #plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
                         
             #draw lines of mean tree
             if plot_means:
@@ -253,10 +305,10 @@ def draw_means(opts,X_test,model,treedepth,b,c,d,subset_len):
             #draw lines of tree
             x = [parent[0],left[0]]
             y = [parent[1],left[1]]
-            #plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
             x = [parent[0],right[0]]
             y = [parent[1],right[1]]
-            #plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
+            plt.plot(x,y, c=color[clr], linewidth=5/(clr+1))
                         
             #draw lines of mean tree
 
@@ -327,7 +379,27 @@ def np_compute_avg_distortion_tree(data_u, data_v, b=2,treedepth=6,c=10):
             # add noise?
     dist = np.array(dist)
     return np.mean(dist)
-            
+
+def np_compute_avg_distortion_tree_eucl(data_u, data_v, b=2,treedepth=6,c=10):        
+    dist = []
+    for i in range(len(data_u)):
+        for j in range(b**treedepth-1):
+            parent_u = np.expand_dims(data_u[i,j,0,:],0)
+            left_u = np.expand_dims(data_u[i,2*j+1,0,:],0)
+            right_u = np.expand_dims(data_u[i,2*j+2,0,:],0)
+            parent_v = np.expand_dims(data_v[i,j,0,:],0)
+            left_v = np.expand_dims(data_v[i,2*j+1,0,:],0)
+            right_v = np.expand_dims(data_v[i,2*j+2,0,:],0)
+            d_v_left = np.linalg.norm(parent_v-left_v)
+            d_u_left = np.linalg.norm(parent_u-left_u)
+            d_v_right = np.linalg.norm(parent_v-right_v)
+            d_u_right = np.linalg.norm(parent_u-right_u)
+            dist.append(np.abs(d_v_left - d_u_left)/d_u_left)
+            dist.append(np.abs(d_v_right - d_u_right)/d_u_right)
+            # add noise?
+    dist = np.array(dist)
+    return np.mean(dist)
+
 def np_compute_avg_distortion_all(data_u, data_v):        
     # all unique pairs
     d_u = [np.linalg.norm(data_u[p1] - data_u[p2]) for p1 in range(len(data_u)) for p2 in range(p1+1,len(data_u))]
@@ -335,3 +407,20 @@ def np_compute_avg_distortion_all(data_u, data_v):
     d_u = np.array(d_u)
     d_v = np.array(d_v)
     return np.mean(np.abs(d_v-d_u)/d_u)
+
+def np_compute_avg_distortion_all_eucl(data_u, data_v):        
+    # all unique pairs
+    d_u = scipy.spatial.distance.cdist(data_u,data_u)
+    d_v = scipy.spatial.distance.cdist(data_v,data_v)
+    
+    d_u = d_u + np.eye(d_u.shape[0])
+    d_v = d_v + np.eye(d_v.shape[0])    
+    
+    print(d_u)
+
+    print(d_u.shape)
+    
+    #print("closed to zero sum", np.sum(np.array(d_u<1e-5,dtype=np.int)))
+    return np.mean(np.abs(d_v-d_u)/d_u)
+
+

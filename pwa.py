@@ -51,7 +51,11 @@ class PWA(object):
         #self.log_sigma = exp_map(tf.layers.dense(f3,self.dim_z,name='enc_sigma',activation=tf.nn.softplus),c=self.c)
         
         # make these layers fully hyperbolic
-        self.mu = hyp_fflayer(e,self.dim_z,name='mu',activation=self.act_mu)
+        
+        if self._opts['hyp_mu']:
+            self.mu = hyp_fflayer(e,self.dim_z,name='mu',activation=self.act_mu)
+        else:
+            self.mu = exp_map(tf.layers.dense(e,self.dim_z,name='enc_mu',activation=self.act_mu,use_bias=self._opts['use_bias']),c=self.c)
 
         #self.mu = exp_map(tf.layers.dense(e,self.dim_z,name='mu',activation=None),c=self.c)
         if self._opts['scalar_dispersion']:
@@ -59,6 +63,11 @@ class PWA(object):
                 self.log_sigma = hyp_fflayer(e,1,name='sigma',activation=self.act_sigma)
             else:
                 self.log_sigma = tf.layers.dense(e,1,name='sigma',activation=self.act_sigma)
+        elif self._opts['reparam'] == 'fullcov':
+            if self._opts['hyp_var']:
+                self.log_sigma = hyp_fflayer(e,self.dim_z**2,name='sigma',activation=self.act_sigma)
+            else:    
+                self.log_sigma = tf.layers.dense(e,self.dim_z**2,name='sigma',activation=self.act_sigma)
         else:
             if self._opts['hyp_var']:
                 self.log_sigma = hyp_fflayer(e,self.dim_z,name='sigma',activation=self.act_sigma)
@@ -71,8 +80,11 @@ class PWA(object):
         #N(z_mu,z_sigma)
         #eps = tf.random_normal(shape=tf.shape(self.log_sigma_z_sq),mean=0,stddev=1,dtype=tf.float32)
         #self.z = tf.add(self.z_mu,tf.sqrt(1e-8 + tf.exp(self.log_sigma_z_sq)) * eps,name='sample')
-        if self._opts['reparam_eucl']:
-            self.z, eps_sample = reparam_h_2(self.mu, self.log_sigma, prior_var=self._opts['prior_var'])
+        if self._opts['reparam'] == 'wrapped':
+            self.z, eps_sample = reparam_h_wrapped(self.mu, self.log_sigma, prior_var=self._opts['prior_var'])
+        elif self._opts['reparam'] == 'fullcov':
+            cov = tf.reshape(self.log_sigma,[-1,self.dim_z,self.dim_z])
+            self.z, eps_sample = reparam_h_wrapped(self.mu, cov, prior_var=self._opts['prior_var'])
         else:
             self.z, eps_sample = reparam_h(self.mu, self.log_sigma, radius=1.0, 
                                          c=self.c, use_expmap=self.use_expmap, 
@@ -84,11 +96,11 @@ class PWA(object):
         self.logmap_z_norm = tf.norm(log_map(self.z),2)
         
         if self._opts['nw_type'] == 'simple':
-            #self.x_hat, self.x_hat_s = dec_simple(tf_log_map_x(self.mu,self.z,self.c),self._opts)
             if self._opts['dec_mlr']:
                 self.x_hat, self.x_hat_s = dec_mlr(self.z,self._opts)
             else:
-                self.x_hat, self.x_hat_s = dec_simple(log_map(self.z,self.c),self._opts)
+                self.x_hat, self.x_hat_s = dec_simple(tf_log_map_x(self.mu,self.z,self.c),self._opts)
+                #self.x_hat, self.x_hat_s = dec_simple(log_map(self.z,self.c),self._opts)
             
         else:
             #self.x_hat, self.x_hat_s = dec_mlp(tf_log_map_x(self.mu,self.z,self.c),self._opts)
@@ -126,7 +138,9 @@ class PWA(object):
             prior_sample = exp_map(self._opts['prior_var']*tf.random_normal(tf.shape(self.mu)),self.c)
         else:
             #prior_sample = project_hyp_vec(sample_gauss_pd(tf.shape(self.mu),radius=0.88,sigma=self._opts['prior_var']),c=self.c)
-            prior_sample = project_hyp_vec(sample_gauss_hn_(tf.shape(self.mu),radius=1.0,sigma=self._opts['prior_var']),c=self.c)
+            #prior_sample = project_hyp_vec(sample_gauss_hn_(tf.shape(self.mu),radius=1.0,sigma=self._opts['prior_var']),c=self.c)
+            prior_sample = sample_gauss_hn_(tf.shape(self.mu),radius=1.0,sigma=self._opts['prior_var'])
+
 
         self.z_prior_norm = tf.norm(prior_sample,2)
         self.mmd_loss = mmd_penalty(mmd_params,prior_sample,self.z,sigma=self._opts['sigma_mmd'],q=self.q)
@@ -164,9 +178,9 @@ class PWA(object):
         self.train_op_adam_rsgd = tf.group([apply_rsgd_op,
                                     self.optim_adam.apply_gradients(grad_adam_clipped)]) 
         # via retraction approximation
-        self.train_op_adam_rsgd_retract = tf.group([self.optim_rsgd.apply_gradients(self.grad_rsgd),
-                                  self.optim_adam.apply_gradients(grad_adam_clipped),
-                                  self.reproj_weights()])
+        #self.train_op_adam_rsgd_retract = tf.group([self.optim_rsgd.apply_gradients(self.grad_rsgd),
+        #                          self.optim_adam.apply_gradients(grad_adam_clipped),
+        #                          self.reproj_weights()])
         
 
         self.check_op = tf.add_check_numerics_ops()

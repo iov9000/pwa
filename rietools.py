@@ -1,6 +1,8 @@
 import tensorflow as tf
 import numpy as np
 from scipy.special import erf,erfc,gamma
+import tensorflow_probability as tfp
+tfd = tfp.distributions
 
 def cayley(u,v):
     x = (u**2 + v**2-1)/(u**2+(1+v)**2)
@@ -166,6 +168,12 @@ def gauss_prob_pd_r(r,sigma):
     p = 1/Z*tf.exp(-r**2/(2*sigma**2))*tf.sinh(r)
     return p
 
+def np_gauss_prob_pd_r(r,sigma):
+    # using poincaré half-plane
+    Z = np.sqrt(np.pi/2)*sigma*np.exp(sigma**2/2)*erf(sigma/np.sqrt(2.0))
+    p = 1/Z*np.exp(-r**2/(2*sigma**2))*np.sinh(r)
+    return p
+
 def np_sample_gauss_pd(shape,oversample=5,radius=0.85,sigma=1.0):
     # rejection sample in Poincaré half-plane
     d = shape[1]
@@ -293,43 +301,27 @@ def sample_gauss_hn_(shape,oversample=5,radius=1.0,sigma=1.0):
     unif_samples = tf.expand_dims(r[:n],1)*direction
     return tf.reshape(samples[:n],shape)
 
-def sample_gauss_hn__(shape,batch_size,oversample=5,radius=1.0,sigma=1.0):
+def np_sample_gauss_hn_(shape,oversample=5,radius=1.0,sigma=1.0):
     # rejection sample in Poincaré disk
     n = shape[0] # batch_sizes
     d = shape[1]    
     n_samples = shape[0]*oversample
-    p = tf.random_uniform([n_samples])
+    p = np.random.rand(n_samples)
     #r = tf.acosh(1+p*(tf.cosh(radius-1e-5)-1)) # support (-3sigma, 3sigma)
-    d_fl = tf.cast(d,tf.float32)
-    r = tf.pow((p*tf.pow(radius,d_fl)),(1/d_fl))
-
-    #i = tf.constant(0)
-    #def body(i,outputs):
-    samples_all = []
-    #sigma_list = tf.unstack(sigma)
-    for sig in sigma_list:
-        f_r = gauss_prob_pd_r(r,sigma[i])
-        g_r = 1/radius#tf.exp(r) # proposal
+    d_fl = np.cast(d,np.float32)
+    r = np.pow((p*np.pow(radius,d_fl)),(1/d_fl))
+    f_r = np_gauss_prob_pd_r(r,sigma)
+    g_r = 1/radius#tf.exp(r) # proposal
     
-        M = tf.reduce_max(f_r/g_r) # empirical M
-        accepted = tf.random_uniform([n_samples]) < (f_r/(M*g_r))
-        r_a = tf.boolean_mask(r,accepted)
-        samples_all.append(r_a)
-        #outputs = outputs.write(i, r_a)
+    M = tf.reduce_max(f_r/g_r) # empirical M
+    accepted = tf.random_uniform([n_samples]) < (f_r/(M*g_r))
+    r_a = tf.boolean_mask(r,accepted)
+    #dir_a = tf.boolean_mask(direction,accepted)
 
-        #return [i, outputs]
-
-    # do the loop:
-    #outputs = tf.TensorArray(dtype=tf.float32, infer_shape=False, size=1, 
-    #                 dynamic_size=True)
-    #_, outputs = tf.while_loop(lambda i, *_: tf.less(i, n), body, [i, outputs])
-    #outputs = outputs.stack()
-    #print(outputs)
-    
-    r_samples = tf.stack([outputs[i][0] for i in range(len(sigma_list))])
     direction = sample_unit_sphere(n,d)
-    samples = tf.expand_dims(r_samples,1)*direction 
-    return samples
+    samples = tf.expand_dims(r_a[:n],1)*direction
+    unif_samples = tf.expand_dims(r[:n],1)*direction
+    return tf.reshape(samples[:n],shape)
 
 def reparam_h(mu,log_sigma,radius=0.88,c=1.0,scalar_dispersion=False,use_expmap=False,prior_var=1.0):
     sigma = tf.exp(0.5*log_sigma)
@@ -352,9 +344,17 @@ def reparam_h(mu,log_sigma,radius=0.88,c=1.0,scalar_dispersion=False,use_expmap=
     #return add_res, project_hyp_vec(prior_sample,c)
     return z, eps_sample
 
-def reparam_h_2(mu,log_sigma,c=1.0,prior_var=1.0):
+def reparam_h_wrapped(mu,log_sigma,c=1.0,prior_var=1.0):
     sigma = tf.exp(0.5*log_sigma)
-    scaled_eps = exp_map(sigma*tf.random_normal(tf.shape(mu))/tf_lambda_x(mu,c),c)
+    scaled_eps = exp_map(tf.sqrt(sigma)*tf.random_normal(tf.shape(mu))/tf_lambda_x(mu,c),c)
     z = exp_map_x(mu,scaled_eps,c)
     #return add_res, project_hyp_vec(prior_sample,c)
     return z, scaled_eps
+
+def reparam_h_fullcov(mu,cov,c=1.0,prior_var=1.0):
+    mvn = tfd.MultivariateNormalFullCovariance(
+    loc=[0.0,0.0],
+    covariance_matrix=cov)
+    sample = mvn.sample(tf.shape(mu)[0])
+    z = exp_map_x(mu,sample,c)
+    return z, sample
