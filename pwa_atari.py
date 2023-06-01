@@ -416,8 +416,10 @@ if __name__ == '__main__':
 
     if torch.cuda.is_available():
         accelerator = 'gpu'
+        torch.set_default_tensor_type(torch.cuda.FloatTensor)
     else:
         accelerator = 'cpu'
+        torch.set_default_tensor_type(torch.FloatTensor)
 
     non_default = {
         opt.dest: getattr(opt, opt.dest)
