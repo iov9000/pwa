@@ -428,14 +428,15 @@ if __name__ == '__main__':
     }
 
     id_string = str(non_default).replace(' ','').replace(':','').replace('Namespace','').replace('{','').replace('}','').replace("'","_").replace(",","_")
-    
+    generator = torch.Generator(device='cuda') if args.accelerator == 'gpu' else None
+
     if opt.dataset == 'mnist':
         dataset = MNIST('data/mnist', download=True, 
                 transform=transforms.Compose([ToTensor()]))#, lambda x: x>0, lambda x: x.float()]))
-        train_loader = DataLoader(dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True)
+        train_loader = DataLoader(dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True, generator=generator)
     else:
         atari_dataset = AtariDataset('demos/demo_hf_BreakoutNoFrameskip-v4_100.pkl')
-        train_loader = DataLoader(atari_dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True)
+        train_loader = DataLoader(atari_dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True, generator=generator)
 
     pwa = PWA(opt)
     trainer = pl.Trainer(max_epochs=opt.n_epochs, accelerator=accelerator)
