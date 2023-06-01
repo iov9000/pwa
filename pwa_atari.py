@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from pathlib import Path
 
 import pickle
 
@@ -16,6 +17,7 @@ from torchvision.transforms import ToTensor
 from torchvision import transforms, datasets
 
 import pytorch_lightning as pl
+from datetime import datetime
 
 from tqdm.notebook import tqdm
 from argparse import Namespace
@@ -338,6 +340,7 @@ class PWA(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         x, y = batch
+        self.saved_batch = x
         res = self.forward(x)
             
         x_hat = res['x_hat']
@@ -411,6 +414,11 @@ if __name__ == '__main__':
 
     opt = parser.parse_args()
 
+    if torch.cuda.is_available():
+        accelerator = 'gpu'
+    else:
+        accelerator = 'cpu'
+
     non_default = {
         opt.dest: getattr(opt, opt.dest)
         for opt in parser._option_string_actions.values()
@@ -418,7 +426,6 @@ if __name__ == '__main__':
     }
 
     id_string = str(non_default).replace(' ','').replace(':','').replace('Namespace','').replace('{','').replace('}','').replace("'","_").replace(",","_")
-
     
     if opt.dataset == 'mnist':
         dataset = MNIST('data/mnist', download=True, 
@@ -429,8 +436,16 @@ if __name__ == '__main__':
         train_loader = DataLoader(atari_dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True)
 
     pwa = PWA(opt)
-
-    trainer = pl.Trainer(max_epochs=opt.n_epochs)
+    trainer = pl.Trainer(max_epochs=opt.n_epochs, accelerator=accelerator)
     trainer.fit(model=pwa, train_dataloaders=train_loader)
 
-    ### TODO: fix nan!
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    log_dir = os.path.join('results', ts+id_string)
+    Path(f"{log_dir}").mkdir(exist_ok=True, parents=True)
+
+    if opt.dataset == 'mnist':
+        plot_disk(opt, pwa, h=28, w=28, savefig=f"{log_dir}/mnist_disk.png")
+        plot_recon(opt, pwa, savefig=f"{log_dir}/mnist_recon.png")
+    else:
+        plot_disk(opt, pwa, savefig=f"{log_dir}/atari_disk.png")
+        plot_recon(opt, pwa, savefig=f"{log_dir}/atari_recon.png")

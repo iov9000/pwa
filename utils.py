@@ -45,7 +45,8 @@ class AtariDataset(torch.utils.data.Dataset):
 
         return image, self.d['acs']
 
-def plot_recon(model, batch, savefig=None):
+def plot_recon(opt, model, savefig=None):
+    batch = model.saved_batch
     h = batch.shape[-1]
     w = batch.shape[-1]
     # 10x10 grid
@@ -71,7 +72,7 @@ def plot_recon(model, batch, savefig=None):
     if savefig is not None:
         plt.savefig(savefig)
 
-def plot_disk(model, h=84, w=84, savefig=None):
+def plot_disk(opt, model, h=84, w=84, savefig=None):
     n = 40
     x = np.linspace(-1.0, 1.0, n)
     y = np.linspace(-1.0, 1.0, n)
