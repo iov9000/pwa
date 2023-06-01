@@ -410,8 +410,6 @@ if __name__ == '__main__':
     parser.add_argument('--b', type=int, default=2, help='Number of noise points per vertex')
     parser.add_argument('--treedepth', type=int, default=6, help='Depth of the tree used in the Randomized SVD Gradient Descent optimizer')
 
-    args = parser.parse_args()
-
     opt = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -428,7 +426,7 @@ if __name__ == '__main__':
     }
 
     id_string = str(non_default).replace(' ','').replace(':','').replace('Namespace','').replace('{','').replace('}','').replace("'","_").replace(",","_")
-    generator = torch.Generator(device='cuda') if args.accelerator == 'gpu' else None
+    generator = torch.Generator(device='cuda') if accelerator == 'gpu' else None
 
     if opt.dataset == 'mnist':
         dataset = MNIST('data/mnist', download=True, 
