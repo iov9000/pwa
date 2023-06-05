@@ -366,7 +366,7 @@ def sq_distances(x,y,scaled=True):
     dotprods = torch.matmul(x, y.t())
     # ||x-y||^2 = ||x||^2 + ||y||^2 - 2*||x||*||y||
     d = sq_norms_x + sq_norms_y.T - 2. * dotprods
-    d_scaled = d/((1-sq_norms_x)*(1-sq_norms_y))
+    d_scaled = d/((1-sq_norms_x)*(1- sq_norms_y.T))
     d_scaled = 1+2*torch.where(d_scaled<1.0, torch.ones_like(d_scaled)+1e-10, d_scaled)
     return sq_norms_x, sq_norms_y, d_scaled
 

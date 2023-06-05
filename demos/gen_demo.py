@@ -3,8 +3,7 @@ import gym
 import numpy as np
 import pickle
 from huggingface_sb3 import load_from_hub
-from stable_baselines3 import PPO
-from stable_baselines3 import SAC
+from stable_baselines3 import PPO, DQN, SAC, A2C
 from stable_baselines3.common.evaluation import evaluate_policy
 from stable_baselines3.common.atari_wrappers import AtariWrapper
 from stable_baselines3.common.env_util import make_atari_env
@@ -61,6 +60,10 @@ if __name__ == '__main__':
     }
     if algo == 'sac':
         model = SAC.load(checkpoint, custom_objects=custom_objects)
+    elif algo == 'dqn':
+        model = DQN.load(checkpoint, custom_objects=custom_objects)
+    elif algo == 'a2c':
+        model = A2C.load(checkpoint, custom_objects=custom_objects)
     else:
         model = PPO.load(checkpoint, custom_objects=custom_objects)
     env = make_atari_env(env_name, n_envs=1, seed=0)

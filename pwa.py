@@ -1,311 +1,563 @@
 import os
-import tensorflow as tf
-import numpy as np
-from rietools import *
-from tools import *
-from layers import *
+from argparse import Namespace, ArgumentParser
 
-class PWA(object):
-    def __init__(self,opts):
-        self._opts = opts
-        self.lr_adam = opts['lr_adam']
-        self.lr_rsgd = opts['lr_rsgd']
-        self.batch_size = opts['batch_size']
-        self.beta_mmd = opts['beta_mmd']
-        self.beta_kld = opts['beta_kld']
-        self.lambda_mmd = opts['lambda_mmd']
-        self.varregnorm = opts['varregnorm']
-        self.dim_z = opts['dim_z']
-        self.c = opts['hyp_c']
-        self.q = opts['mmd_q']
-        self.use_expmap= opts['use_expmap']
-        self.act_mu = opts['enc_act_mu']
-        self.act_sigma = opts['enc_act_sigma']
-        
-        #build a network
-        self.build()
-        #launch a session
-        #self.sess.run(tf.global_variables_initializer())  
-        checkpoint_dir = os.path.expanduser("./"+'/ckpt')
-        saver_hook = tf.train.CheckpointSaverHook(
-            checkpoint_dir=checkpoint_dir,
-            save_steps=3000,
-            saver=tf.train.Saver())
-            #hooks = [saver_hook]
-        hooks = []
-        self.sess = tf.train.SingularMonitoredSession(hooks=hooks,checkpoint_dir=checkpoint_dir)
-        
-    #build a network
-    def build(self):
-        #input
-        self.x = tf.placeholder(name='x',dtype=tf.float32,shape=[None,self._opts['input_dim']])  #shape=(batch_size,input_dim)
-        #self.bs_ph = tf.placeholder(name='bs',dtype=tf.int32,shape=())
-        #encoder
-        if self._opts['nw_type'] == 'simple':
-            e = enc_simple(self.x,self._opts)
-        else:
-            e = enc_mlp(self.x,self._opts)
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from pathlib import Path
 
-        # project Euclidean (mu,sigma) to Poincaré disk
-        #self.mu = exp_map(tf.layers.dense(f3,self.dim_z,name='enc_mu',activation=None),c=self.c)
-        #self.log_sigma = exp_map(tf.layers.dense(f3,self.dim_z,name='enc_sigma',activation=tf.nn.softplus),c=self.c)
-        
-        # make these layers fully hyperbolic
-        
-        if self._opts['hyp_mu']:
-            self.mu = hyp_fflayer(e,self.dim_z,name='mu',activation=self.act_mu)
+import pickle
+
+from torch import Tensor
+from torch.utils.data import DataLoader
+
+from torchvision.datasets import MNIST
+from torchvision.transforms import ToTensor
+from torchvision import transforms, datasets
+
+import pytorch_lightning as pl
+from datetime import datetime
+
+from tqdm.notebook import tqdm
+from argparse import Namespace
+from skimage.transform import resize
+import matplotlib.pyplot as plt
+
+from rietools_pt import *
+from utils import AtariDataset, plot_disk, plot_recon, plot_direction
+
+class HypFFLayer(nn.Module):
+    """ Hyperbolic FF Layer """
+    def __init__(self, size_in, size_out, c=1.0, activation=None, init_bias='zeros'):
+        super().__init__()
+        self.size_in, self.size_out = size_in, size_out
+
+        if activation == 'relu':
+            self.activation = torch.relu
         else:
-            self.mu = exp_map(tf.layers.dense(e,self.dim_z,name='enc_mu',activation=self.act_mu,use_bias=self._opts['use_bias']),c=self.c)
+            self.activation = torch.tanh
+
+        self.c = c
+        weight = torch.Tensor(size_out, size_in)
+        self.weight = nn.Parameter(weight)  # nn.Parameter is a Tensor that's a module parameter.
+        bias = torch.Tensor(size_out)
+        self.bias = nn.Parameter(bias)
+
+        # initialize weights and biases
+        nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5)) # weight init
+        #nn.init.xavier_uniform_(self.weights)
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+        bound = 1 / np.sqrt(fan_in)
+        if init_bias == 'uniform':
+            nn.init.uniform_(self.bias, -bound, bound)  # bias init
+        else:
+            nn.init.zeros_(self.bias)  # bias init
+        backward_hook = self.weight.register_hook(self.rsgd)
+    
+    def rsgd(self, grad):
+        # modify gradients here
+        #print("scaling gradients using Riemannian metric")
+        rsgd_grad = grad*riemannian_gradient_c(grad,self.c)
+        return rsgd_grad  # scaling the gradients by 0.1    
+    
+    def forward(self, x):
+        c = self.c
+        x = exp_map(x,c=self.c) + 1e-7
+        Mx = torch.mm(x, self.weight.t())
+        Mx_norm = torch.norm(Mx, 2, dim=1,keepdim=True)
+        x_norm = torch.norm(x, 2, dim=1,keepdim=True)
+        y = 1./np.sqrt(c)*tf_tanh(Mx_norm/x_norm*tf_atanh(np.sqrt(c)*x_norm))*Mx/Mx_norm
+        y = project_hyp_vec(y,c)
+        y = mobius_add(y,self.bias.unsqueeze(0),c)
+        if self.activation is not None:
+            # hyperbolic non-linearity
+            y = exp_map(self.activation(log_map(y,c)),c)
+        return y
+    
+    
+
+class AtariCNN(nn.Module):
+    # action conditioning?
+    def __init__(self, opt, env, use_actions=False):
+        super().__init__()
+        ob_shapes = list(env.observation_space.shape)
+        ac_shapes = list(env.action_space.shape)
+        if not ac_shapes:
+            ac_shapes = [1]
+
+        if use_actions:
+            ac_dim = ac_shapes[-1]
+        else:
+            ac_dim = 0
+
+        self.obs_network = nn.Sequential(
+            layer_init(nn.Conv2d(4, 32, 8, stride=4)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(32, 64, 4, stride=2)),
+            nn.ReLU(),
+            layer_init(nn.Conv2d(64, 64, 3, stride=1)),
+            nn.ReLU())
+            #nn.Flatten())
+            
+        self.obs_acs_network = nn.Sequential(
+            layer_init(nn.Linear(64 * 7 * 7 + ac_dim, 512)),
+            nn.ReLU(),
+        )
+        #self.critic = layer_init(nn.Linear(512, 1), std=1)
+
+    def forward(self, ob, ac=None):
+        if len(ob.shape) == 3:
+            ob = ob.unsqueeze(0)
+
+        ob_enc = self.obs_network(ob/255)
+        ob_enc = ob_enc.reshape(ob_enc.shape[0], -1)
+        if ac is not None:
+            if len(ac.shape) == 0:
+                ac = ac.unsqueeze(0).unsqueeze(0)
+            elif len(ac.shape) == 1:
+                ac = ac.unsqueeze(0)
+
+            ob_enc = torch.cat([ob_enc, ac], dim=-1)
+            x = self.obs_acs_network(ob_enc)
+        else:
+            x = self.obs_acs_network(ob_enc)
+        
+        return x
+
+
+def atari_enc(dim_out=100, n_channels=1):
+    encoder = nn.Sequential(
+        nn.Conv2d(n_channels, 32, kernel_size=8, stride=4),
+        nn.ReLU(),
+        nn.Conv2d(32, 64, kernel_size=4, stride=3),
+        nn.ReLU(),
+        nn.Conv2d(64, 128, kernel_size=4, stride=2),
+        nn.ReLU(),
+        nn.Flatten(),
+        nn.Linear(512,dim_out)
+    )
+    return encoder
+
+def atari_dec(dim_in=100, n_channels=1):
+    decoder = nn.Sequential(
+        nn.Linear(dim_in, 512),
+        nn.ReLU(),
+        nn.Unflatten(1, (128,2,2)),
+        nn.ConvTranspose2d(128, 64, kernel_size=4, stride=1),
+        nn.ReLU(),
+        nn.ConvTranspose2d(64, 32, kernel_size=4, stride=4),
+        nn.ReLU(),
+        nn.ConvTranspose2d(32,n_channels, kernel_size=8, stride=4),
+        nn.Sigmoid()
+    )
+    return decoder
+
+class AtariFrameAutoencoder(nn.Module):
+    def __init__(self):
+        super(AtariFrameAutoencoder, self).__init__()
+        self.encoder = atari_enc()
+        self.decoder = atari_dec()
+        
+    def forward(self, x):
+        encoded = self.encoder(x)
+        # enc shape / dec input shape: torch.Size([1, 128, 7, 7])
+        decoded = self.decoder(encoded)
+
+        return decoded
+
+def is_any_nan(x):
+    return torch.any(torch.isnan(x))
+
+class PWA(pl.LightningModule):
+    def __init__(self, opt):
+        super().__init__()
+        self.opt = opt
+        #self.automatic_optimization = False
+
+        dim_enc_out = 100
+        if self.opt.dataset == 'mnist':
+            self.encoder = nn.Sequential(nn.Linear(28 * 28, 64), 
+                                         nn.ReLU(), 
+                                         nn.Linear(64, dim_enc_out))
+        elif self.opt.dataset == 'atari':
+            self.encoder = atari_enc(dim_enc_out)
+            
+        if opt.hyp_mu:
+            self.mu_encoder = HypFFLayer(dim_enc_out, opt.dim_z, activation=opt.enc_act_mu)
+        else:
+            self.mu_encoder = nn.Linear(dim_enc_out, opt.dim_z)
+        
+        if opt.scalar_dispersion:
+            if self.opt.hyp_var:
+                self.var_encoder = HypFFLayer(dim_enc_out,1, activation=opt.enc_act_sigma)
+            else:
+                self.var_encoder = nn.Linear(dim_enc_out, 1)
+        elif opt.reparam == 'fullcov':
+            if self.opt.hyp_var:
+                self.var_encoder = HypFFLayer(dim_enc_out, opt.dim_z**2, activation=opt.enc_act_sigma)
+            else:    
+                self.var_encoder = nn.Linear(dim_enc_out, opt.dim_z**2 / 2) # cholesky factor
+        else:
+            if self.opt.hyp_var:
+                self.var_encoder = HypFFLayer(dim_enc_out, opt.dim_z, name='sigma', activation=opt.enc_act_sigma)
+            else:    
+                self.var_encoder = nn.Linear(dim_enc_out, opt.dim_z)
+        
+        if self.opt.dataset == 'mnist':
+            self.decoder = nn.Sequential(nn.Linear(opt.dim_z, 64), 
+                                     nn.ReLU(), 
+                                     nn.Linear(64, 28 * 28),
+                                     nn.Sigmoid())
+        elif self.opt.dataset == 'atari':
+            self.decoder = atari_dec(opt.dim_z)
+
+
+    def mmd_penalty(self, sample_pz, sample_qhat, sigma=None, q=1.0):
+        # assert opts["e_noise"] in ('gaussian'), \
+            # 'MMD++ works only with Gaussian encoders!'
+        # Number of codes per the same pic
+        opt = self.opt
+        ns = opt.nr_mmd_samples
+        n = opt.batch_size
+        ls = opt.dim_z
+        kernel = opt.mmd_kernel
+        sigma2_p = 1 # opt.'pz_scale ** 2
+        opt.pz = 'normal'
+
+        sq_norms_pz, _, dist_pz = hyp_distances(sample_pz,sample_pz,q,opt.c)
+        sq_norms_qhat, dist_qhat_prime, dist_qhat = hyp_distances(sample_qhat,sample_qhat,q,opt.c)
+        _, _, dist_pz_qhat = hyp_distances(sample_pz,sample_qhat,q,opt.c)
+
+        #mask = block_diagonal(
+        #  [np.ones((ns, ns), dtype=np.float32) for i in range(n)],
+        #  np.float32)
+
+        # Median heuristic for the sigma^2 of Gaussian kernel
+        l = int(n/2)
+        if sigma is None:
+            sigma2_k = torch.topk(
+              torch.reshape(dist_pz_qhat, [-1]), l).values[l - 1]
+            sigma2_k += torch.topk(
+              torch.reshape(dist_qhat, [-1]), l).values[l - 1]
+        else:
+            sigma2_k = sigma
+
+        #if opt.'verbose:
+        #    sigma2_k = tf.Print(sigma2_k, [sigma2_k], 'Kernel width:')
+        # Part (1)
+        res1 = torch.exp( - dist_pz / q / sigma2_k)
+        res1 = torch.mul(res1, 1. - torch.eye(n)) # filter i=j pairs of samples
+        res1 = torch.sum(res1) / (n * n - n)
+        # Part (2)
+        res2 = torch.exp( - dist_pz_qhat / q / sigma2_k)
+        res2 = torch.sum(res2) / (n * n) / ns
+        # Part (3)
+        res3 = torch.exp( - dist_qhat / q / sigma2_k)
+        res3 = torch.mul(res3, 1. - torch.eye(n)) # filter i=j pairs of samples
+        res3 = torch.sum(res3) / (n * n - n)
+        stat = res1 - 2 * res2 + res3 
+
+        return stat 
+
+    def generate(self,z):    
+        x_hat = self.decoder(log_map(z,c=self.opt.c))
+
+        return x_hat
+
+    def forward(self, x):
+        input_shape = x.shape
+        if self.opt.dataset == 'mnist':
+            e = self.encoder(x.reshape((self.opt.batch_size,-1)))
+        else:
+            e = self.encoder(x)
 
         #self.mu = exp_map(tf.layers.dense(e,self.dim_z,name='mu',activation=None),c=self.c)
-        if self._opts['scalar_dispersion']:
-            if self._opts['hyp_var']:
-                self.log_sigma = hyp_fflayer(e,1,name='sigma',activation=self.act_sigma)
-            else:
-                self.log_sigma = tf.layers.dense(e,1,name='sigma',activation=self.act_sigma)
-        elif self._opts['reparam'] == 'fullcov':
-            if self._opts['hyp_var']:
-                self.log_sigma = hyp_fflayer(e,self.dim_z**2,name='sigma',activation=self.act_sigma)
-            else:    
-                self.log_sigma = tf.layers.dense(e,self.dim_z**2,name='sigma',activation=self.act_sigma)
+        if self.opt.hyp_mu:
+            mu = self.mu_encoder(e)
         else:
-            if self._opts['hyp_var']:
-                self.log_sigma = hyp_fflayer(e,self.dim_z,name='sigma',activation=self.act_sigma)
-            else:    
-                self.log_sigma = tf.layers.dense(e,self.dim_z,name='sigma',activation=self.act_sigma)
-
-        #self.mu = self.mu/tf.norm(self.mu,2,axis=1,keepdims=True)
-        #self.log_sigma = self.log_sigma/tf.norm(self.log_sigma,2,axis=1,keepdims=True)
-
-        #N(z_mu,z_sigma)
-        #eps = tf.random_normal(shape=tf.shape(self.log_sigma_z_sq),mean=0,stddev=1,dtype=tf.float32)
-        #self.z = tf.add(self.z_mu,tf.sqrt(1e-8 + tf.exp(self.log_sigma_z_sq)) * eps,name='sample')
-        if self._opts['reparam'] == 'wrapped':
-            self.z, eps_sample = reparam_h_wrapped(self.mu, self.log_sigma, prior_var=self._opts['prior_var'])
-        elif self._opts['reparam'] == 'fullcov':
-            cov = tf.reshape(self.log_sigma,[-1,self.dim_z,self.dim_z])
-            self.z, eps_sample = reparam_h_wrapped(self.mu, cov, prior_var=self._opts['prior_var'])
-        else:
-            self.z, eps_sample = reparam_h(self.mu, self.log_sigma, radius=1.0, 
-                                         c=self.c, use_expmap=self.use_expmap, 
-                                         scalar_dispersion=self._opts['scalar_dispersion'],
-                                         prior_var=self._opts['prior_var'])
-        self.mu_norm = tf.norm(self.mu,2)
-        self.sigma_norm = tf.norm(self.log_sigma,2)
-        self.z_norm = tf.norm(self.z,2)
-        self.logmap_z_norm = tf.norm(log_map(self.z),2)
+            mu = exp_map(self.mu_encoder(e), self.opt.c)
+        log_sigma = self.var_encoder(e)
         
-        if self._opts['nw_type'] == 'simple':
-            if self._opts['dec_mlr']:
-                self.x_hat, self.x_hat_s = dec_mlr(self.z,self._opts)
-            else:
-                self.x_hat, self.x_hat_s = dec_simple(tf_log_map_x(self.mu,self.z,self.c),self._opts)
-                #self.x_hat, self.x_hat_s = dec_simple(log_map(self.z,self.c),self._opts)
-            
+        # hyperbolic reparametrization
+        if self.opt.reparam == 'wrapped':
+            qz_sample, eps_sample = reparam_h_wrapped(mu, log_sigma, prior_var=self.opt.prior_var)
+        elif self.opt.reparam == 'fullcov':
+            cov = torch.reshape(log_sigma,[-1,self.dim_z,self.dim_z])
+            qz_sample, eps_sample = reparam_h_wrapped(mu, cov, prior_var=self.opt.prior_var)
         else:
-            #self.x_hat, self.x_hat_s = dec_mlp(tf_log_map_x(self.mu,self.z,self.c),self._opts)
-            self.x_hat, self.x_hat_s = dec_mlp(log_map(self.z,self.c),self._opts)
+            qz_sample, eps_sample = reparam_h(mu, log_sigma, radius=1.0, 
+                                         c=self.opt.c, use_expmap=self.opt.use_expmap, 
+                                         scalar_dispersion=self.opt.scalar_dispersion,
+                                         prior_var=self.opt.prior_var)
+        
 
-        #self.x_hat, self.x_hat_s = dec_simple(self.z,self._opts)        
-        epsilon = 1e-10
-        self.bce = tf.nn.sigmoid_cross_entropy_with_logits(labels=self.x, logits=self.x_hat)
-        if self._opts['loss'] == 'bce':
-            self.recon_loss = tf.reduce_mean(tf.reduce_sum(self.bce, axis=-1))
-            #x = tf.sigmoid(self.x)
-            #x = self.x
-            #self.recon_loss = tf.reduce_mean(-tf.reduce_sum(x*tf.log(self.x_hat_s+epsilon)+(1-x)*tf.log(1-self.x_hat_s+epsilon),axis=1))
-            #self.recon_loss = tf.reduce_mean(-tf.reduce_sum(self.x*tf.log(self.x_hat+epsilon)+(1-self.x)*tf.log(1-self.x_hat+epsilon),axis=1))
-        else:
-            # non deterministic decoder version of L2-loss (N(G_x(Z),0.3*I_n) -> WAE paper)
-            #self.recon_loss = self._opts['recon_weight']*tf.reduce_mean(tf.nn.l2_loss((self.x_hat + 0.3*tf.random_normal(tf.shape(self.x_hat))) - self.x))
-            self.recon_loss = self._opts['recon_weight']*tf.reduce_mean(tf.nn.l2_loss((self.x_hat - self.x)))
-
-            #self.recon_loss = tf.losses.mean_squared_error(labels=self.x,predictions=self.x_hat)
-
-        #self.kld_loss = kld_loss(self.mu,self.log_sigma,d=self.dim_z)        
-        #self.kld_loss = -0.5*tf.reduce_sum(1+self.log_sigma-tf.square(selfmu)- tf.exp(self.log_sigma),axis=1)
-
-        # MMD loss
-        #prior_sample = tf.random_normal([self.batch_size, self.dim_z])
-        #prior_sample = sample_gauss_h(tf.shape(self.mu))
-        mmd_params = {'nr_mmd_samples':1, 
-                  'batch_size':self.batch_size,
-                  'mmd_kernel':'RBF',
-                  'embedding_dim':self.dim_z,
-                  'c':self.c
-                 }
-        if self._opts['use_expmap']:
-            prior_sample = exp_map(self._opts['prior_var']*tf.random_normal(tf.shape(self.mu)),self.c)
+        # sample_prior
+        if self.opt.use_expmap:
+            pz_sample = exp_map(self.opt.prior_var*torch.randn_like(mu),self.c)
         else:
             #prior_sample = project_hyp_vec(sample_gauss_pd(tf.shape(self.mu),radius=0.88,sigma=self._opts['prior_var']),c=self.c)
             #prior_sample = project_hyp_vec(sample_gauss_hn_(tf.shape(self.mu),radius=1.0,sigma=self._opts['prior_var']),c=self.c)
-            prior_sample = sample_gauss_hn_(tf.shape(self.mu),radius=1.0,sigma=self._opts['prior_var'])
-
-
-        self.z_prior_norm = tf.norm(prior_sample,2)
-        self.mmd_loss = mmd_penalty(mmd_params,prior_sample,self.z,sigma=self._opts['sigma_mmd'],q=self.q)
-        self.varreg = tf.reduce_mean(tf.norm(self.log_sigma,self.varregnorm,axis=1))
+            pz_sample = sample_gauss_hn_(mu.shape, radius=1.0, sigma=self.opt.prior_var)
         
-        # one sample MC approximation of KLD
-        logp_prior = tf.log(gauss_prob_pd(prior_sample,self.mu,0))#tf.exp(0.5*self.log_sigma)))
-        logp_posterior = tf.log(gauss_prob_pd(self.z,self.mu,0))#tf.exp(0.5*self.log_sigma)))
-        self.kld_loss = tf.reduce_mean(logp_prior - logp_posterior,0) 
+
+
+        # decode 
+        x_hat = self.decoder(log_map(qz_sample,c=self.opt.c))
+        if self.opt.dataset == 'mnist':
+            x_hat = torch.reshape(x_hat,[*(input_shape)])
+        
+        # print(torch.norm(qz_sample))
+
+        # print(is_any_nan(e), 
+        #     is_any_nan(mu), 
+        #     is_any_nan(log_sigma), 
+        #     is_any_nan(qz_sample), 
+        #     is_any_nan(pz_sample), 
+        #     is_any_nan(x_hat))
+
+        res = {}
+        res['x_hat'] = x_hat
+        res['qz_sample'] = qz_sample
+        res['pz_sample'] = pz_sample
+        res['mu'] = mu
+        res['log_sigma'] = log_sigma
+
+        return res
+
+    def loss(self, x_in, res):
+        x_hat = res['x_hat']
+        log_sigma = res['log_sigma']
+        qz_sample = res['qz_sample']
+        pz_sample = res['pz_sample']
+        
+        mmd_loss = self.mmd_penalty(pz_sample, qz_sample,
+                                    sigma=self.opt.sigma_mmd,
+                                    q=self.opt.mmd_q)
     
-        #total loss
-        self.loss = self.recon_loss + self.beta_mmd*self.mmd_loss + self.lambda_mmd*self.varreg
-        print(mc_elbo(self.x_hat, self.z, self.mu, self.log_sigma))
-        #self.loss = tf.reduce_mean(mc_elbo(self.x_hat, self.z, self.mu, self.log_sigma),0)
-        #self.loss = self.recon_loss - self.beta_kld*self.kld_loss
+        var_reg = torch.mean(torch.norm(log_sigma,-1))
+    
+        #recon_loss = F.mse_loss(x_hat, x_in)
+        recon_loss = F.binary_cross_entropy(x_hat, x_in)#, reduction='sum')
 
-        #optimiser
-        self.optim_adam = tf.train.AdamOptimizer(learning_rate=self.lr_adam)#,beta1=0.5)
-        self.optim_rsgd = tf.train.GradientDescentOptimizer(learning_rate=self.lr_rsgd)
-        self.full_grad_list = self.optim_rsgd.compute_gradients(self.loss)
-        self.grad_rsgd,self.grad_adam = self.scale_grad(self.full_grad_list)
-
-        gradients, variables = zip(*self.grad_adam)
-        gradients = [tf.check_numerics(gr,'nan found: '+gr.name) for gr in gradients]
-        gradients = [tf.clip_by_norm(gr, 1.0-1e-5) for gr in gradients]
-        grad_adam_clipped = list(zip(gradients,variables)) 
-        # Do two sets of gradients - one with just (mu,sigma) and one without for adam
-        apply_rsgd_op, self.rsgd_steps = self.apply_rsgd(self.lr_rsgd)
-
-
-        self.train_op_adam_clipped = self.optim_adam.apply_gradients(grad_adam_clipped)
-        self.train_op_adam = self.optim_adam.apply_gradients(self.grad_adam)
-
-        # full exp_map
-        self.train_op_adam_rsgd = tf.group([apply_rsgd_op,
-                                    self.optim_adam.apply_gradients(grad_adam_clipped)]) 
-        # via retraction approximation
-        #self.train_op_adam_rsgd_retract = tf.group([self.optim_rsgd.apply_gradients(self.grad_rsgd),
-        #                          self.optim_adam.apply_gradients(grad_adam_clipped),
-        #                          self.reproj_weights()])
+        loss_dict = {'recon': recon_loss,
+                     'mmd': mmd_loss,
+                     'var_norm': var_reg
+                    }
         
-
-        self.check_op = tf.add_check_numerics_ops()
-        self.summarize_op = self.summarize()
-        t = tf.trainable_variables()
-        norms = []
-        for var in t:
-            print(var)
-            norms.append(tf.nn.l2_loss(var))
+        return recon_loss + self.opt.beta_mmd*mmd_loss + self.opt.lambda_mmd*var_reg, loss_dict
+    
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        self.saved_batch = x
+        res = self.forward(x)
             
-        self.norms = norms
-        #self.train_op = self.optim_adam.minimize(self.loss)
-        self.reproj_op = self.reproj_weights()
-        
-    def get_latent_var(self):
-        var_list = []
-        for v in tf.trainable_variables():
-            #if 'mu/bias' in v.name or 'sigma/bias' in v.name or 'hypbias' in v.name:
-            if 'mu/bias' in v.name or 'P_mlr' in v.name or 'hypbias' in v.name:
-                var_list.append(v)
-                
-        return var_list
+        x_hat = res['x_hat']
+        qz_sample = res['qz_sample']
+        pz_sample = res['pz_sample']
+
+        loss, loss_dict = self.loss(x, res)
+        # optim_adam, optim_rsgd = self.optimizers()
+        # optim_adam.zero_grad()
+        # optim_rsgd.zero_grad()
+
+        # self.manual_backward(loss)
+        # if self.opt.reparam == 'hyp':
+        #     self.mu_encoder.weight.grad = self.mu_encoder.weight.grad*riemannian_gradient_c(self.mu_encoder.weight.grad,self.opt.c)
+        # optim_adam.step()
+        # optim_rsgd.step()
+        # Include extra logging here
+        return loss
+    
+    def configure_optimizers(self):
+        optim_adam = optim.Adam([{'params': self.encoder.parameters()},
+                                 {'params': self.var_encoder.parameters()},
+                                 {'params': self.decoder.parameters()}], lr=self.opt.lr_adam)
+        optim_rsgd = optim.SGD(self.mu_encoder.parameters(), lr=self.opt.lr_rsgd)
+        ## TODO: use Riemannian Adam
+        optim_adam = optim.Adam(self.parameters(), lr=self.opt.lr_adam)
+        #optim_rsgd.register_step_pre_hook(self.rsgd)
+
+        return optim_adam#(optim_adam, optim_rsgd)
+
+class VAE(pl.LightningModule):
+    def __init__(self, opt):
+        super().__init__()
+        self.opt = opt
+        dim_enc_out = 100
+        if self.opt.dataset == 'mnist':
+            self.encoder = nn.Sequential(nn.Linear(28 * 28, 64), 
+                                         nn.ReLU(), 
+                                         nn.Linear(64, dim_enc_out))
+        elif self.opt.dataset == 'atari':
+            self.encoder = atari_enc(dim_enc_out)
             
-    @tf.custom_gradient
-    def scale_grad_layer(x):
-        def grad(g):
-            return g*(1-var_norm)**2/4
-        return tf.identity(x), grad
-                      
-    def scale_grad(self,gradient_list,c=1.0):
-        grad_rsgd = []
-        grad_adam = []
-        for g,v in gradient_list:
-            if 'mu/bias' in v.name or 'P_mlr' in v.name or 'hypbias' in v.name:
-            #if 'mu/bias' in v.name or 'sigma/bias' in v.name or 'hypbias' in v.name:
-                print(g,v)
-                grad_rsgd.append((g*riemannian_gradient_c(v,c),v))
-            else:
-                grad_adam.append((g,v))
-        return grad_rsgd, grad_adam
-    
-    def apply_rsgd(self,lr):
-        hyp_vars = self.get_latent_var()
-        hyp_grads = tf.gradients(self.loss, hyp_vars)
-        clipped_hyp_grads = [tf.clip_by_norm(grad, 1.-1e-5) for grad in hyp_grads]  ###### Clip gradients
+        self.mu_encoder = nn.Linear(dim_enc_out, opt.dim_z)
+        self.var_encoder = nn.Linear(dim_enc_out, opt.dim_z)
 
-        def rsgd(v,g,lr):
-            #return exp_map_x(v, -mobius_scalar_mul(lr,g,c=1.0), c=1.0)
-            return tf.squeeze(exp_map_x(tf.expand_dims(v,0),-lr*tf.expand_dims(g,0), c=1.0),0)
-            
-        update_ops = []
-        steps = []
-        for i in range(len(hyp_vars)):
-            riemannian_rescaling_factor = riemannian_gradient_c(hyp_vars[i], c=1.0)
-            g_r = riemannian_rescaling_factor * clipped_hyp_grads[i]
-            updated_var = rsgd(hyp_vars[i], g_r, lr)
-            steps.append(updated_var)
-            update_ops.append(tf.assign(hyp_vars[i], updated_var))
-        #apply_op = tf.group([tf.assign(v,exp_map_x(v, -lr * g, c=1.0)) for (g,v) in zip(*grad_rsgd)])
-        apply_op = tf.group(update_ops)
-        return apply_op, steps
-    
-    def reproj_weights(self):
-        #parameter_list = tf.trainable_variables()
-        parameter_list = self.get_latent_var()
-        #global_norm = tf.Print(tf.global_norm(parameter_list),[tf.global_norm(parameter_list)],first_n=5)
-        global_norm = tf.global_norm(parameter_list)
-        eps = 1e-5
-        reproj_assign_op = tf.group([tf.assign(param,tf.squeeze(param/tf_norm(tf.expand_dims(param,0)),0)-eps) for param in parameter_list])
-        reproj_op = tf.cond(global_norm>=1,true_fn=lambda:reproj_assign_op,false_fn=tf.no_op)
+        if self.opt.dataset == 'mnist':
+            self.decoder = nn.Sequential(nn.Linear(opt.dim_z, 64), 
+                                     nn.ReLU(), 
+                                     nn.Linear(64, 28 * 28))
+        elif self.opt.dataset == 'atari':
+            self.decoder = atari_dec(opt.dim_z)
 
-        return reproj_op
+    def generate(self,z):    
+        x_hat = self.decoder(z)
 
-    def summarize(self):
-        t = tf.trainable_variables()
-        summaries = []
-        for var in t:
-            summaries.append(tf.summary.scalar("var/" + var.name, tf.norm(var)))
+        return x_hat
+
+    def forward(self, x):
+        input_shape = x.shape
+        if self.opt.dataset == 'mnist':
+            e = self.encoder(x.reshape((self.opt.batch_size,-1)))
+        else:
+            e = self.encoder(x)
+
+        mu = self.mu_encoder(e)
+        log_sigma = self.var_encoder(e)
         
-        return tf.summary.merge(summaries)
+        # reparametrization
+        z, eps = self.reparameterize(mu, log_sigma)
+
+        # decode 
+        x_hat = self.decoder(z)
+        if self.opt.dataset == 'mnist':
+            x_hat = torch.reshape(x_hat,[*(input_shape)])
+        
+        res = {}
+        res['x_hat'] = x_hat
+        res['qz_sample'] = z
+        res['pz_sample'] = eps
+        res['mu'] = mu
+        res['log_sigma'] = log_sigma
+
+        return res
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5*log_var)
+        eps = torch.randn_like(std)
+        return mu + eps*std, eps
+
+    def loss(self, x, res):
+        x_hat = res['x_hat']
+        log_sigma = res['log_sigma']
+        qz_sample = res['qz_sample']
+        pz_sample = res['pz_sample']
+        mu = res['mu']
+        
+        BCE = F.binary_cross_entropy(x_hat, x)#, reduction='sum')
+        KLD = torch.mean(-0.5 * torch.sum(1 + log_sigma - mu.pow(2) - log_sigma.exp(),dim=1),dim=0)
+
+        loss_dict = {'recon': BCE, 'kld': KLD}
+
+        return BCE + self.opt.beta_kld*KLD, loss_dict
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        self.saved_batch = x
+        res = self.forward(x)
+
+        loss, loss_dict = self.loss(x, res)
+        # Include extra logging here
+        return loss
     
-    #execute single forward and backward pass    
-    #report loss
-    def run_single_step(self,x):
-        #writer = tf.summary.FileWriter('./graphs', self.sess.graph)
-        _, logmap_norm, norms, x, x_hat, loss, rloss, mloss, kloss, z_norm, zp_norm, mu, sigma, z = self.sess.run([self.train_op_adam_rsgd,
-                                    self.logmap_z_norm,
-                                    self.norms,
-                                    self.x,
-                                    self.x_hat_s,
-                                    self.loss,
-                                    self.recon_loss,
-                                    self.mmd_loss,
-                                    self.kld_loss,
-                                    self.z_norm,
-                                    self.z_prior_norm,
-                                    self.mu,
-                                    self.log_sigma,                                                                     
-                                    self.z], feed_dict={self.x: x})
-        
-        #print(logmap_norm)
-        #print("Encoder output: Mu norm", np.linalg.norm(mu))
-        #print("Encoder output: Log sigma norm", np.linalg.norm(sigma))
+    def configure_optimizers(self):
+        return optim.Adam(self.parameters(), lr=self.opt.lr_adam)
 
-        #step = tf.train.get_global_step()
-        #writer.add_summary(summary,step)
-        #rep = self.sess.run(self.reproj_op)
-        #print(np.linalg.norm(mu),np.linalg.norm(sigma))
 
-        return loss, mloss, rloss, kloss, np.mean(mu,0), np.mean(sigma,0)
-        
-    #reconstruction
-    #x->x_hat
-    def reconstruction(self,x):
-        return self.sess.run([self.x_hat,self.z], feed_dict={self.x: x})
-        
-    #generation
-    #z->x_hat
-    def generate(self,z):
-        return self.sess.run(self.x_hat,feed_dict={self.z: z})
+if __name__ == '__main__':
+    parser = ArgumentParser()
+    parser.add_argument('--seed', type=int, default=1234)
+    parser.add_argument('--vae_model', default='pwa', help='model (pwa / vae)')
+    parser.add_argument('--dataset', default='atari', help='model (mnist / atari)')
+    parser.add_argument('--input_dim', default=784, help='environment type')
+    parser.add_argument('--nw_type', type=str, default='mlp', help='network type')
+    parser.add_argument('--n_epochs', type=int, default=100, help='number of training epochs')
 
-    #transformation of features
-    #x->z
-    def transformer(self,x):
-        return self.sess.run(self.z,feed_dict={self.x: x})
-    
-    def transformer_mu(self,x):
-        return self.sess.run(self.mu,feed_dict={self.x: x})
+    # Model options
+    parser.add_argument('--dim_z', type=int, default=2, help='Dimensionality of the latent space')
+    parser.add_argument('--init_std', type=float, default=0.01, help='Standard deviation for weight initialization')
+    parser.add_argument('--use_bias', type=bool, default=True, help='Whether to use bias terms in the neural network layers')
+    parser.add_argument('--init_bias', type=float, default=0.0, help='Initial value for the bias terms')
+    parser.add_argument('--prior_var', type=float, default=1.0, help='Variance of the prior distribution')
+    parser.add_argument('--reparam', type=str, default='hyp', choices=['hyp', 'expmap'], help='Reparameterization method for sampling latent variables')
+    parser.add_argument('--dec_mlr', default=False, action='store_true', help='Whether to use decoding mean-log variance regularization')
+    parser.add_argument('--enc_act_mu', type=str, default='tanh', help='Activation function for the mean of the encoder')
+    parser.add_argument('--enc_act_sigma', type=str, default=None, help='Activation function for the standard deviation of the encoder')
+    parser.add_argument('--binarize',default=False, action='store_true', help='Whether to binarize the input')
+    parser.add_argument('--nr_mmd_samples', type=int, default=1, help='Number of samples for MMD calculation')
+    parser.add_argument('--mmd_kernel', type=str, default='laplacian', choices=['laplacian', 'gaussian'], help='Kernel type for MMD')
+
+    # Training options
+    parser.add_argument('--lr_adam', type=float, default=1e-3, help='Learning rate for the Adam optimizer')
+    parser.add_argument('--lr_rsgd', type=float, default=1e-3, help='Learning rate for the Riemannian SGD optimizer')
+    parser.add_argument('--batch_size', type=int, default=100, help='Batch size for training')
+    parser.add_argument('--loss', type=str, default='l2', choices=['l2', 'bce'], help='Loss type')
+    parser.add_argument('--recon_weight', type=float, default=1.0, help='Weight for the reconstruction loss')
+    parser.add_argument('--beta_mmd', type=float, default=100.0, help='Weight for the MMD loss term')
+    parser.add_argument('--sigma_mmd', type=float, default=1.0, help='Laplacian kernel width for MMD')
+    parser.add_argument('--mmd_q', type=int, default=1, help='Power parameter for MMD')
+    parser.add_argument('--varregnorm', type=int, default=2, help='Norm type for variance regularizer')
+    parser.add_argument('--lambda_mmd', type=float, default=1.0, help='Weight for the variance regularizer term')
+    parser.add_argument('--beta_kld', type=float, default=0.1, help='Weight for the KLD loss term')
+
+    # Other options
+    parser.add_argument('--hyp_c', type=float, default=1.0, help='Parameter value for the hyperbolic space curvature')
+    parser.add_argument('--c', type=float, default=1.0, help='Parameter value for the hyperbolic space curvature')
+    parser.add_argument('--use_expmap', default=False, action='store_true', help='Whether to use the exponential map function in the hyperbolic space')
+    parser.add_argument('--hyp_mu', default=True, action='store_true', help='Whether to use hyperbolic mean  for the mean of the distribution')
+    parser.add_argument('--hyp_var', default=False, action='store_true', help='Whether to use hyperbolic variance for the variance of the distribution')
+    parser.add_argument('--scalar_dispersion', default=True, action='store_false', help='Whether to use scalar dispersion as the measure of dispersion in the hyperbolic space')
+
+    # binary tree generation
+    parser.add_argument('--b', type=int, default=2, help='Number of noise points per vertex')
+    parser.add_argument('--treedepth', type=int, default=6, help='Depth of the tree used in the Randomized SVD Gradient Descent optimizer')
+
+    opt = parser.parse_args()
+
+    if torch.cuda.is_available():
+        accelerator = 'gpu'
+        torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    else:
+        accelerator = 'cpu'
+        torch.set_default_tensor_type(torch.FloatTensor)
+
+    non_default = {
+        opt.dest: getattr(opt, opt.dest)
+        for opt in parser._option_string_actions.values()
+        if hasattr(opt, opt.dest) and opt.default != getattr(opt, opt.dest)
+    }
+
+    id_string = str(non_default).replace(' ','').replace(':','').replace('Namespace','').replace('{','').replace('}','').replace("'","_").replace(",","_")
+    generator = torch.Generator(device='cuda') if accelerator == 'gpu' else None
+
+    if opt.dataset == 'mnist':
+        dataset = MNIST('data/mnist', download=True, 
+                transform=transforms.Compose([ToTensor()]))#, lambda x: x>0, lambda x: x.float()]))
+        train_loader = DataLoader(dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True, generator=generator)
+    else:
+        atari_dataset = AtariDataset('demos/demo_hf_SpaceInvadersNoFrameskip-v4_10.pkl')
+        train_loader = DataLoader(atari_dataset, batch_size=opt.batch_size, shuffle=True, drop_last=True, generator=generator)
+
+    if opt.vae_model == 'pwa':
+        model = PWA(opt)
+    else:
+        model = VAE(opt)
+    trainer = pl.Trainer(max_epochs=opt.n_epochs, accelerator=accelerator)
+    trainer.fit(model=model, train_dataloaders=train_loader)
+
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    log_dir = os.path.join('results', ts+id_string)
+    Path(f"{log_dir}").mkdir(exist_ok=True, parents=True)
+
+    if opt.dataset == 'mnist':
+        if opt.dim_z == 2:
+            plot_disk(opt, model, h=28, w=28, savefig=f"{log_dir}/mnist_disk.png", bw=True)
+        plot_recon(opt, model, savefig=f"{log_dir}/mnist_recon.png")
+        plot_direction(opt, model, savefig=f"{log_dir}/mnist_dir.png")
+    else:
+        if opt.dim_z == 2:
+            plot_disk(opt, model, savefig=f"{log_dir}/atari_disk.png")
+        plot_recon(opt, model, savefig=f"{log_dir}/atari_recon.png")
+        plot_direction(opt, model, savefig=f"{log_dir}/atari_dir.png")
